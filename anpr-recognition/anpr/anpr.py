@@ -1,87 +1,61 @@
-from skimage.segmentation import clear_border
 import pytesseract
-import numpy as np
-import imutils
+import matplotlib.pyplot as plt
 import cv2
+from skimage.segmentation import clear_border
 
 
 class ANPR:
-    def __init__(self, minAR=4, maxAR=6, debug=False):
+    def __init__(self, minAR=1, maxAR=6, debug=False):
         self.minAR = minAR
         self.maxAR = maxAR
         self.debug = debug
 
-    def debug_imshow(self, title, image, waitKey=False):
+    def debug_imshow(self, image):
         if self.debug:
-            cv2.imshow(title, image)
+            plt.imshow(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+            plt.show()
 
-            if waitKey:
-                cv2.waitKey(0)
+    @staticmethod
+    def locate_license_plate_candidate(gray, keep=5):
+        gray = cv2.blur(gray, (4, 5))
+        canny = cv2.Canny(gray, 150, 250)
+        canny = cv2.dilate(canny, None, iterations=2)
 
-    def locate_license_plate_candidate(self, gray, keep=5):
-        rectKern = cv2.getStructuringElement(cv2.MORPH_RECT, (13, 5))
-        blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, rectKern)
-        self.debug_imshow('Blackhat', blackhat)
+        cnts, _ = cv2.findContours(canny, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
 
-        squadKern = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        light = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, squadKern)
-        light = cv2.threshold(light, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
-        self.debug_imshow('Light Regions', light)
+        cv2.drawContours(canny, cnts, 0, (0, 255, 0), 2)
+        cv2.imshow('Canny', canny)
+        cv2.waitKey(0)
 
-        gradX = cv2.Sobel(blackhat, ddepth=cv2.CV_32F, dx=1, dy=1, ksize=1)
-        gradX = np.absolute(gradX)
-        (minVal, maxVal) = (np.min(gradX), np.max(gradX))
-        gradX = 255 * (gradX - minVal) / (maxVal - minVal)
-        gradX = gradX.astype("uint8")
-        self.debug_imshow("Scharr", gradX)
-
-        gradX = cv2.GaussianBlur(gradX, (5, 5), 0)
-        gradX = cv2.morphologyEx(gradX, cv2.MORPH_CLOSE, rectKern)
-        thresh = cv2.threshold(gradX, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
-        self.debug_imshow('Grad Thresh', thresh)
-
-        thresh = cv2.erode(thresh, None, iterations=2)
-        thresh = cv2.dilate(thresh, None, iterations=2)
-        self.debug_imshow('Grad Erode/Dilate', thresh)
-
-        thresh = cv2.bitwise_and(thresh, thresh, mask=light)
-        thresh = cv2.dilate(thresh, None, iterations=2)
-        thresh = cv2.erode(thresh, None, iterations=1)
-        self.debug_imshow("Final", thresh, waitKey=True)
-
-        cnts = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL,
-                                cv2.CHAIN_APPROX_SIMPLE)
-        cnts = imutils.grab_contours(cnts)
-        cnts = sorted(cnts, key=cv2.contourArea, reverse=True)[:keep]
-        # return the list of contours
         return cnts
 
-    def locate_license_plate(self, gray, candidates, clearBorder=False):
+    @staticmethod
+    def locate_license_plate(gray, candidates, clearBorder=False):
+        lp = None
         lpCnt = None
-        roi = None
 
         for c in candidates:
+            area = cv2.contourArea(c)
             (x, y, w, h) = cv2.boundingRect(c)
-            ar = w / float(h)
+            epsilon = 0.09 * cv2.arcLength(c, True)
+            approx = cv2.approxPolyDP(c, epsilon, True)
 
-            if self.minAR <= ar <= self.maxAR:
-                lpCnt = c
-                licensePlate = gray[y:y + h, x:x + w]
-                roi = cv2.threshold(licensePlate, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[1]
+            if len(approx) == 4 and (5000 < area < 5500):
+                print('Approx -> {}'.format(len(approx)))
+                aspect_ratio = float(w) / h
+                print('Plate aspect ratio: ', aspect_ratio)
+                if aspect_ratio > 1.2:
+                    # cv2.drawContours(gray, [c], -1, (0, 255, 0), 2)
+                    lp = gray[y:y + h, x:x + w]
+                    lpCnt = c
 
-                if clearBorder:
-                    roi = clear_border(roi)
+        return lp, lpCnt
 
-                    self.debug_imshow("License Plate", licensePlate)
-                    self.debug_imshow("ROI", roi, waitKey=True)
-                    break
-
-        return roi, lpCnt
-
-    def build_tesseract_options(self, psm=7):
-        alphanumeric = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
-        options = '-c tessedit_char_whitelist={}'.format(alphanumeric)
-
+    @staticmethod
+    def build_tesseract_options(psm=7):
+        alphanumeric = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+        options = "-c tessedit_char_whitelist={}".format(alphanumeric)
+        # set the PSM mode
         options += " --psm {}".format(psm)
 
         return options
@@ -91,11 +65,15 @@ class ANPR:
 
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         candidates = self.locate_license_plate_candidate(gray)
-        (lp, lpCnt) = self.locate_license_plate(gray, candidates, clearBorder=clearBorder)
-
-        if lp is not None:
+        (license_plate, lpCnt) = self.locate_license_plate(image, candidates, clearBorder=clearBorder)
+        # only OCR the license plate if the license plate ROI is not
+        # empty
+        if license_plate is not None:
             options = self.build_tesseract_options(psm=psm)
-            lpText = pytesseract.image_to_string(lp, config=options)
-            self.debug_imshow("License Plate #", lpText)
+            lpText = pytesseract.image_to_string(license_plate, config=options)
 
+        # return a 2-tuple of the OCR'd license plate text along with
+        # the contour associated with the license plate region
+        print('Plate -> ', lpText)
+        print('Plate Contour -> ', lpCnt)
         return lpText, lpCnt
